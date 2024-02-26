@@ -183,6 +183,7 @@ class Transformer(nn.Module):
         self.vaq_criterion = torch.nn.CrossEntropyLoss(ignore_index=0)
         self.qav_criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
         self.inference_criterion = torch.nn.CrossEntropyLoss(ignore_index=0, reduction='none')
+        self.qav_inference_criterion = torch.nn.CrossEntropyLoss(ignore_index=-1, reduction='none')
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -268,15 +269,92 @@ class Transformer(nn.Module):
             vaq_output = self.output(vaq_h)
             vaq_output = vaq_output[:, :-1, :].reshape(-1, self.vocab_size)
             vaq_loss = self.vaq_criterion(vaq_output, vaq_label)
-            
+
         if self.args.qav and not inference:
             qav_h = self.norm(qav_h)
             qav_output = torch.bmm(qav_h[:, :-1].float(), _video_feature.transpose(1, 2).float()).reshape(-1, self.max_feats)
             qav_loss = self.qav_criterion(qav_output / self.tau, qav_label)
-        
+
         if inference:
             logits = self.inference_criterion(vqa_output, vqa_label)
             logits = logits.reshape(bsz, n_options, -1)
             return logits
         else:
             return vqa_loss, vaq_loss, qav_loss
+        
+        
+    def inference_triplet(self, data, logits = False):
+        video = data['video'].cuda()
+        vqa_id, vaq_id, qav_id = data['text_id']['vqa'].cuda(), data['text_id']['vaq'].cuda(), data['text_id']['qav'].cuda()
+        vqa_label, vaq_label, qav_label = data['label']['vqa'].cuda(), data['label']['vaq'].cuda(), data['label']['qav'].cuda()
+        vqa_video_start, vaq_video_start, qav_video_index = data['video_start']['vqa'][0], data['video_start']['vaq'][0], data['video_index']['qav'].cuda()
+        
+        bsz, n_options, seqlen = vqa_id.shape
+        vqa_id, vaq_id = vqa_id.reshape(-1, seqlen), vaq_id.reshape(-1, seqlen)
+        vqa_label, vaq_label = vqa_label.reshape(-1, seqlen), vaq_label.reshape(-1, seqlen)
+        vqa_label, vaq_label = vqa_label[:, 1:].flatten(), vaq_label[:, 1:].flatten()
+        
+        qav_id = qav_id.reshape(-1, seqlen)
+        qav_label = qav_label.reshape(-1, seqlen)
+        qav_video_mask = qav_label.ge(0)
+        qav_label = qav_label[:, 1:].flatten()
+        
+        
+        with torch.no_grad():
+            vqa_h = self.tok_embeddings(vqa_id)
+            vaq_h = self.tok_embeddings(vaq_id)
+            qav_h = self.tok_embeddings(qav_id)
+            
+        freqs_cis = self.freqs_cis.to(vqa_h.device)
+        freqs_cis = freqs_cis[:seqlen]
+        mask = None
+        mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=vqa_h.device)
+        mask = torch.triu(mask, diagonal=0 + 1).type_as(vqa_h)
+        start_pos = 0
+        
+        adapter = self.adapter_query.weight.reshape(-1, self.adapter_len, self.params.dim).unsqueeze(1)
+
+        _video_feature = self.visual_proj(video)
+
+        _video_feature = _video_feature.unsqueeze(1).repeat(1, n_options, 1, 1).view(-1, _video_feature.shape[-2], _video_feature.shape[-1])
+
+        video_feature = (_video_feature + self.temporal_emb.weight[None, :, :]).half()
+        
+        vqa_h = vqa_h.clone()
+        vqa_h[:, vqa_video_start:vqa_video_start+self.max_feats] = video_feature
+
+        vaq_h = vaq_h.clone()
+        vaq_h[:, vaq_video_start:vaq_video_start+self.max_feats] = video_feature
+            
+        qav_h = qav_h * ~qav_video_mask[..., None]
+        qav_h.scatter_add_(1, qav_video_index[..., None].repeat(1, 1, self.params.dim), video_feature)
+        
+        for i, layer in enumerate(self.layers[-1 * self.adapter_layer:]):
+            vqa_h = layer(vqa_h, start_pos, freqs_cis, mask, adapter[i].half(), vqa_video_start)
+            vaq_h = layer(vaq_h, start_pos, freqs_cis, mask, adapter[i].half(), vaq_video_start)
+            qav_h = layer(qav_h, start_pos, freqs_cis, mask, adapter[i].half(), None)
+        
+        
+        vqa_h = self.norm(vqa_h)
+        vqa_output = self.output(vqa_h)
+        vqa_output = vqa_output[:, :-1, :].reshape(-1, self.vocab_size)
+        
+        vaq_h = self.norm(vaq_h)
+        vaq_output = self.output(vaq_h)
+        vaq_output = vaq_output[:, :-1, :].reshape(-1, self.vocab_size)
+        
+        qav_h = self.norm(qav_h)
+        qav_output = torch.bmm(qav_h[:, :-1].float(), _video_feature.transpose(1, 2).float()).reshape(-1, self.max_feats)
+        
+        if logits:
+            vqa_logits = self.inference_criterion(vqa_output, vqa_label)
+            vaq_logits = self.inference_criterion(vaq_output, vaq_label)
+            qav_logits = self.qav_inference_criterion(qav_output / self.tau, qav_label)
+
+            vqa_logits = vqa_logits.reshape(bsz, n_options, -1)
+            vaq_logits = vaq_logits.reshape(bsz, n_options, -1)
+            qav_logits = qav_logits.reshape(bsz, n_options, -1)
+
+            return vqa_logits, vaq_logits, qav_logits
+
+        return vqa_output, vaq_output, qav_output

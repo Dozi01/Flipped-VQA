@@ -83,3 +83,48 @@ def val_one_epoch(model: torch.nn.Module, data_loader: Iterable, optimizer: torc
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+
+def val_triplet(model: torch.nn.Module, data_loader: Iterable, optimizer: torch.optim.Optimizer, epoch: int, args=None):
+    model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = int(len(data_loader) / 4)
+
+    for data_iter_step, data in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+
+        answer = data['answer'].cuda()
+        bsz = answer.shape[0]
+
+        with torch.no_grad():
+            vqa_logit, vaq_logit, qav_logit = model.inference_triplet(data, logits = True)
+        
+        vqa_logit_count = (vqa_logit != 0).sum(-1)
+        vqa_logit = (vqa_logit.sum(-1) / vqa_logit_count) 
+        vqa_logit = vqa_logit / vqa_logit.sum(-1).unsqueeze(1)
+        
+        vaq_logit_count = (vaq_logit != 0).sum(-1)
+        vaq_logit = (vaq_logit.sum(-1) / vaq_logit_count) 
+        vaq_logit = vaq_logit / vaq_logit.sum(-1).unsqueeze(1)
+
+        qav_logit_count = (qav_logit != 0).sum(-1)
+        qav_logit = (qav_logit.sum(-1) / qav_logit_count) 
+        qav_logit = qav_logit / qav_logit.sum(-1).unsqueeze(1)
+
+        prediction = (vqa_logit + vaq_logit + qav_logit).argmin(-1)
+
+        eval = (answer == prediction)
+        acc = eval.sum().item() / bsz
+        
+        misc.log_qtype(data, eval, metric_logger, args)
+
+        lr = optimizer.param_groups[0]["lr"]
+        metric_logger.update(lr=lr)
+        metric_logger.update(n=bsz, acc=acc)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
